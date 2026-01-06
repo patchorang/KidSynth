@@ -3,6 +3,11 @@
 using namespace daisy;
 using namespace daisy::seed;
 #include "daisysp.h"
+// #include "kick.h" // 
+
+// constexpr size_t SAMPLE_LEN = KICK_LEN; 
+// size_t sample_pos = SAMPLE_LEN;
+// bool sample_playing = false;
 
 // Create out Daisy Seed Hardware object
 DaisySeed hw;
@@ -10,15 +15,36 @@ daisysp::Oscillator osc;
 daisysp::Oscillator osc2;
 daisysp::Svf filter;
 
+enum EnvState {
+  ENV_IDLE,
+  ENV_ATTACK,
+  ENV_SUSTAIN,
+  ENV_RELEASE
+};
+
+EnvState env_state = ENV_IDLE;
+float env = 0.0f;
+
 // Knob setups
 AnalogControl tempo_knob;
 Parameter tempo_param;
 float cutoff = 1000.0f;
 float resonance = 0.1f;
 float osc_mod_amount = 0.0f;
-float resonance_mod_amount = 0.0f;
+float cutoff_mod_amount = 0.0f;
 float max_cutoff = 8000.0f;
 float min_cutoff = 200.0f;
+
+// Envelope paramaters
+// Attack/Release are hardcoded
+// Sustain is always at 1
+// You can adjust sustain time to fill the rest of the step.
+float attack_time = 0.05f;
+float release_time = 0.05f;
+float step_length_samples = 0.0f; 
+float sustain_samples = 0.0f;
+float sustain_time = 0.1f;
+float sustain_counter = 0.0f;
 
 AnalogControl cutoff_knob;
 Parameter cutoff_param;
@@ -27,11 +53,13 @@ Parameter resonance_param;
 AnalogControl osc_mod_knob;
 Parameter osc_mod_param;
 
-AnalogControl resonance_mod_knob;
-Parameter resonance_mod_param;
+AnalogControl cutoff_mod_knob;
+Parameter cutoff_mod_param;
 
-// AnalogControl waveform_knob;
-// Parameter waveform_param;
+AnalogControl sustain_knob;
+Parameter sustain_param;
+
+AnalogControl snare_in;
 
 // Button setups
 Switch delay_button;
@@ -46,26 +74,22 @@ Switch bitcrush_button;
 GPIO bitcrush_led;
 bool bitcrush_enabled = false;
 
-enum WAVEFORMS {
-  saw = daisysp::Oscillator::WAVE_SAW,
-  square = daisysp::Oscillator::WAVE_SQUARE,
-  tri = daisysp::Oscillator::WAVE_TRI,
-  NUM_WAVEFORMS = 3
-};
-
 Switch waveform_button;
 GPIO waveform_led;
-int waveform = saw;
+int waveform = daisysp::Oscillator::WAVE_SAW;
+
+Switch sequence_button;
+GPIO sequence_led;
 
 // Setup delay
 constexpr size_t MAX_DELAY = 96000;
 daisysp::DelayLine<float, MAX_DELAY> delay;
 
 // Delay state
-float delay_target = 12000.0f; 
-float delay_smooth = 12000.0f;
-float feedback = 0.35f;
-float mix = 0.4f;
+float delay_target = 15000.0f; 
+float delay_smooth = 15000.0f;
+float feedback = 0.2f;
+float mix = 0.3f;
 
 //Step timing (the clock)
 float phase = 0.0f;
@@ -81,13 +105,57 @@ float step_freqs[NUM_STEPS] = {
   220.0f, 330.0f, 440.0f, 330.0f, 220.0f, 165.0f, 330.0f, 440.0f
 };
 
+constexpr int MAJOR_SCALE[7] = {0, 2, 4, 5, 7, 9, 11};
+constexpr int MINOR_SCALE[7] = {0, 2, 3, 5, 7, 8, 10};
+constexpr int degree_weights[7] = {3, 1, 2, 1, 3, 1, 1};
+
+int key_root;
+bool is_major;
+bool is_bassline = false;
+
 int current_step = 0;
+
+void generate_sequence() {
+  is_major = rand() % 2 == 0;
+  is_bassline = !is_bassline;
+  int starting_note = is_bassline? 36 : 48;
+  key_root = starting_note + (rand() % 7);
+
+  const int* scale = is_major ? MAJOR_SCALE : MINOR_SCALE;
+  int prev_degree = 0;
+  for (int i = 0; i < NUM_STEPS; i++) {
+
+    int degree = rand() % 7;
+    // first note is always degree
+    if (i == 0) {
+      degree = 0;
+    } else if (i == NUM_STEPS - 1) {
+      // end on dominant
+      degree = 4;
+    } else {
+      int step_change = (rand() %3) - 1;
+      degree = prev_degree + step_change;
+      if (degree < 0) degree = 0;
+      if (degree > 6) degree = 6;
+    }
+    prev_degree = degree;
+
+    int octave = 0;
+    if (rand() % 4 == 0) octave = 12;
+    int note = key_root + scale[degree] + octave;
+
+    // Convert MIDI note to frequency
+    step_freqs[i] = 440.0f * powf(2.0f, (note - 69) / 12.0f);
+  }
+}
 
 enum AdcChannel {
   tempo = 0,
   filter_cutoff,
   osc_mod,
-  resonance_mod,
+  sustain,
+  cutoff_mod,
+  snare,
   NUM_ADC_CHANNELS
 };
 
@@ -112,6 +180,12 @@ float bitcrush_sample(float in, int &counter, int step)
   return hold;
 }
 
+// void TriggerSample()
+// {
+//     sample_pos = 0;
+//     sample_playing = true;
+// }
+
 void MyCallback(AudioHandle::InputBuffer in, AudioHandle::OutputBuffer out, size_t size) {
   for (size_t i = 0; i < size; i++) {
     
@@ -121,6 +195,17 @@ void MyCallback(AudioHandle::InputBuffer in, AudioHandle::OutputBuffer out, size
     // Convert BPM -> Hz
     float step_hz = (bpm_smooth / 60.0f) * steps_per_beat;
     float phase_inc = step_hz / hw.AudioSampleRate();
+    step_length_samples = hw.AudioSampleRate() / ((bpm_smooth / 60.0f) * steps_per_beat);
+
+    // Play sample
+    // float sample_out = 0.0f;
+
+    // if(sample_playing)
+    // {
+    //     sample_out = kick[sample_pos++];
+    //     if(sample_pos >= SAMPLE_LEN)
+    //         sample_playing = false;
+    // }
 
     //Advance phasor
     phase += phase_inc;
@@ -129,6 +214,9 @@ void MyCallback(AudioHandle::InputBuffer in, AudioHandle::OutputBuffer out, size
       phase -= 1.0f;
       current_step = (current_step + 1) % NUM_STEPS;
       osc.SetFreq(step_freqs[current_step]);
+
+      //retriger the envelope
+      env_state = ENV_ATTACK;
 
       //update the osc modulator
       float detune = 0.5f;
@@ -141,13 +229,49 @@ void MyCallback(AudioHandle::InputBuffer in, AudioHandle::OutputBuffer out, size
       }
     }
 
+    // Calculate the envelope
+    switch (env_state) {
+      case ENV_IDLE:
+        env = 0.0f;
+        break;
+
+      case ENV_ATTACK: 
+        env += 1.0f / (attack_time * hw.AudioSampleRate());
+        if (env >= 1.0f) {
+          env = 1.0f;
+          env_state = ENV_SUSTAIN;
+          sustain_counter = 0.0f;
+        }
+        break;
+
+      case ENV_SUSTAIN:
+        env = 1.0f;
+        sustain_counter += 1.0f;
+        if (sustain_counter >= sustain_samples) {
+          env_state = ENV_RELEASE;
+        }
+        break;
+
+      case ENV_RELEASE:
+        env -= 1.0f / (release_time * hw.AudioSampleRate());
+        if(env <= 0.0f) {
+          env = 0.0f;
+          env_state = ENV_IDLE;
+        }
+        break;
+
+    }
+
     // Update the signal, and warm it up
     float sig = osc.Process();
+
     float osc_drive = 3.0f;
     sig = tanhf(sig * osc_drive);
 
-    // Add in osc mudulator
+    // Add in osc modulator
     sig = sig + (osc2.Process() * fabs(osc_mod_amount));
+
+    sig *= env;
 
     filter.SetFreq(cutoff);
     filter.SetRes(resonance);
@@ -164,16 +288,14 @@ void MyCallback(AudioHandle::InputBuffer in, AudioHandle::OutputBuffer out, size
     out_sig *= filter_drive;
 
     if(delay_enabled) {
-      // Simple distortion effect
-      // out_sig = out_sig * 5.0f;
-      // if(out_sig > 1.0f) out_sig = 1.0f;
-      // if(out_sig < -1.0f) out_sig = -1.0f;
-
       delay_smooth += 0.0003f * (delay_target - delay_smooth);
       float delayed = delay.Read(delay_smooth);
       delay.Write(out_sig + (delayed * feedback));
       out_sig = out_sig * (1-mix) + (delayed * mix);
     }
+
+    // Mix in sample
+    // out_sig += sample_out;
 
     out[0][i] = out_sig;
     out[1][i] = out_sig;
@@ -181,20 +303,21 @@ void MyCallback(AudioHandle::InputBuffer in, AudioHandle::OutputBuffer out, size
 }
 
 int main(void) {
+  generate_sequence();
   // Initialize the Daisy Seed hardware
   hw.Configure();
   hw.Init();
-  // hw.StartLog();
+  hw.StartLog();
 
   int sample_rate = hw.AudioSampleRate();
 
   // Init oscillator
   osc.Init(sample_rate);
-  osc.SetWaveform(saw);
-  osc.SetAmp(0.02f);
+  osc.SetWaveform(daisysp::Oscillator::WAVE_SAW);
+  osc.SetAmp(0.05f);
 
   osc2.Init(sample_rate);
-  osc2.SetWaveform(daisysp::Oscillator::WAVE_SIN);
+  osc2.SetWaveform(daisysp::Oscillator::WAVE_SAW);
   osc2.SetAmp(0.08f);
 
   // Init filter
@@ -209,8 +332,9 @@ int main(void) {
   adc_config[tempo].InitSingle(A0);
   adc_config[filter_cutoff].InitSingle(A4);
 	adc_config[osc_mod].InitSingle(A1);
-	adc_config[resonance_mod].InitSingle(A2);
-  // adc_config[waveform].InitSingle(A3);
+	adc_config[cutoff_mod].InitSingle(A2);
+  adc_config[sustain].InitSingle(A3);
+  adc_config[snare].InitSingle(A5);
   hw.adc.Init(adc_config, NUM_ADC_CHANNELS);
   hw.adc.Start();
 
@@ -233,17 +357,23 @@ int main(void) {
     true
   );
 
-  resonance_mod_knob.Init(
-    hw.adc.GetPtr(resonance_mod),
+  sustain_knob.Init(
+    hw.adc.GetPtr(sustain),
     hw.AudioSampleRate(),
     true
   );
 
-  // waveform_knob.Init(
-  //   hw.adc.GetPtr(waveform),
-  //   hw.AudioSampleRate(),
-  //   true
-  // );
+  cutoff_mod_knob.Init(
+    hw.adc.GetPtr(cutoff_mod),
+    hw.AudioSampleRate(),
+    true
+  );
+
+  snare_in.Init(
+    hw.adc.GetPtr(snare),
+    hw.AudioSampleRate(),
+    false
+  );
 
   // Buttons
   delay_button.Init(D1, hw.AudioSampleRate(), Switch::TYPE_MOMENTARY, Switch::POLARITY_INVERTED, Switch::PULL_UP);
@@ -261,20 +391,26 @@ int main(void) {
   bitcrush_button.Init(D7, hw.AudioSampleRate(), Switch::TYPE_MOMENTARY, Switch::POLARITY_INVERTED, Switch::PULL_UP);
   bitcrush_led.Init (D8, GPIO::Mode::OUTPUT);
 
+  // Sequence button
+  sequence_button.Init(D9, hw.AudioSampleRate(), Switch::TYPE_MOMENTARY, Switch::POLARITY_INVERTED, Switch::PULL_UP);
+  sequence_led.Init (D10, GPIO::Mode::OUTPUT);
+
   // Map knob to frequency range
   tempo_param.Init(tempo_knob, 40.0f, 240.0f, Parameter::LOGARITHMIC);
   cutoff_param.Init(cutoff_knob, min_cutoff, max_cutoff, Parameter::LOGARITHMIC);
   resonance_param.Init(cutoff_knob, 0.1f, 0.9f, Parameter::LINEAR);
   osc_mod_param.Init(osc_mod_knob, -1.0f, 1.0f, Parameter::LINEAR);
-  resonance_mod_param.Init(resonance_mod_knob, -0.5f, 0.5f, Parameter::LINEAR);
-  // waveform_param.Init(waveform_knob, 0.0f, 3.0f, Parameter::LINEAR);
+  sustain_param.Init(sustain_knob, 0.05f, 1.0, Parameter::LINEAR);
+  float cutoff_range = (max_cutoff - min_cutoff)/2;
+  cutoff_mod_param.Init(cutoff_mod_knob, -1.0*cutoff_range, cutoff_range, Parameter::LINEAR);
 
   // Start the audio with our callback function
   hw.StartAudio(MyCallback);
 
+  // bool piezo_armed = true;
+  // uint32_t piezo_cooldown = 0;
 
   while (1) {
-
     //update tempo
     tempo_knob.Process();
     double_tempo_button.Debounce();
@@ -290,21 +426,43 @@ int main(void) {
     waveform_button.Debounce();
     waveform_led.Write(waveform_button.Pressed());
     if(waveform_button.RisingEdge()) {
-      waveform = (waveform + 1) % NUM_WAVEFORMS;
+      if (waveform == daisysp::Oscillator::WAVE_SAW) {
+        waveform = daisysp::Oscillator::WAVE_SQUARE;
+      } else if (waveform == daisysp::Oscillator::WAVE_SQUARE) {
+        waveform = daisysp::Oscillator::WAVE_TRI;
+      } else {
+        waveform = daisysp::Oscillator::WAVE_SAW;
+      }
       osc.SetWaveform(waveform);
-      // osc2.SetWaveform(waveform);
+      osc2.SetWaveform(waveform);
     }
+
+    // Generate new sequence
+    sequence_button.Debounce();
+    sequence_led.Write(sequence_button.Pressed());
+    if(sequence_button.RisingEdge()) {
+      generate_sequence();
+    }
+
+    //update envelope
+    sustain_time = 0.1f + sustain_param.Process();
+    float sustain_fraction = sustain_param.Process();
+    sustain_samples = sustain_fraction * step_length_samples;
 
     //update filter cutoff
     cutoff_knob.Process();
     cutoff = cutoff_param.Process();
     resonance = resonance_param.Process();
+
+    // apply cutoff modulation
+    cutoff_mod_knob.Process();
+    float cutoff_mod_value = cutoff_mod_param.Process();
+    cutoff += cutoff_mod_value;
+    cutoff = fminf(fmaxf(cutoff, 200), 12000);
     
     // update modulation amounts
     osc_mod_knob.Process();
-    resonance_mod_knob.Process();
     osc_mod_amount = osc_mod_param.Process();
-    resonance_mod_amount = resonance_mod_param.Process();
     
     // Check buttons
     delay_button.Debounce();
@@ -315,10 +473,33 @@ int main(void) {
     bitcrush_enabled = bitcrush_button.Pressed();
     bitcrush_led.Write(bitcrush_enabled);
 
+    // Check piezo input
+    // float piezo_threshold = 0.05f;
+
+    // snare_in.Process();
+    // float snare_val = snare_in.Value();
+    // hw.PrintLine("anv %f", snare_val);
+
+
+    // if(piezo_cooldown > 0) 
+    // {
+    //   piezo_cooldown--;
+    // }
+
+    // if(snare_val > piezo_threshold && piezo_armed && piezo_cooldown == 0) {
+    //   piezo_armed = false;
+    //   piezo_cooldown = 2000;
+
+    //   TriggerSample();
+    // }
+
+    // if(snare_val < 0.02f) {
+    //   piezo_armed = true;
+    // }
+
     // In order to know that everything's working let's print that to a serial console:
-    // hw.PrintLine("cut %f", val);
-    // hw.PrintLine("res %f", val2);
-    // System::Delay(100);
+    // hw.PrintLine("anv %f", env_time);
+    // hw.PrintLine("attack %f", attack_time);
 
     System::Delay(1);
   }
