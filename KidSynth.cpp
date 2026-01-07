@@ -3,11 +3,13 @@
 using namespace daisy;
 using namespace daisy::seed;
 #include "daisysp.h"
+#include <cstdlib>  // for rand() and srand()
 
 // Create out Daisy Seed Hardware object
 DaisySeed hw;
 daisysp::Oscillator osc;
 daisysp::Oscillator osc2;
+daisysp::Oscillator lfo;
 daisysp::Svf filter;
 
 enum EnvState {
@@ -107,6 +109,10 @@ constexpr int degree_weights[7] = {3, 1, 2, 1, 3, 1, 1}; // Bias towards, 1, 3, 
 int key_root;
 bool is_major;
 bool is_bassline = false; // Sequence will alternate between a bassline and melody
+
+// LFO modulation range
+float lfo_freq = 0.2f;
+float lfo_cutoff_mod = 200.0f;
 
 enum AdcChannel {
   tempo = 0,
@@ -223,6 +229,12 @@ void InitSynthElements(int sample_rate) {
   osc2.Init(sample_rate);
   osc2.SetWaveform(daisysp::Oscillator::WAVE_SAW);
   osc2.SetAmp(0.08f);
+
+  // Init lfo
+  lfo.Init(sample_rate);
+  lfo.SetWaveform(daisysp::Oscillator::WAVE_SIN);
+  lfo.SetFreq(lfo_freq);
+  lfo.SetAmp(1.0f);
 
   // Init filter
   filter.Init(sample_rate);
@@ -427,7 +439,6 @@ void UpdateBitcrush() {
   bitcrush_led.Write(bitcrush_enabled);
 }
 
-
 void MyCallback(AudioHandle::InputBuffer in, AudioHandle::OutputBuffer out, size_t size) {
   for (size_t i = 0; i < size; i++) {
 
@@ -441,15 +452,17 @@ void MyCallback(AudioHandle::InputBuffer in, AudioHandle::OutputBuffer out, size
     float osc_drive = 3.0f;
     sig = tanhf(sig * osc_drive);
 
+    // Update the lfo
+    float lfo_sig = lfo.Process();
+
     // Add in detune osc
     sig = sig + (osc2.Process() * fabs(osc_mod_amount));
 
-    // Apply the envlope 
-    sig *= env;
+   
 
     // Apply the filter
-    filter.SetFreq(cutoff);
-    filter.SetRes(resonance);
+    filter.SetFreq((cutoff + (lfo_cutoff_mod * lfo_sig)) + (env * 1000));
+    filter.SetRes(resonance + (lfo_sig * 0.1f));
     filter.Process(sig);
     float out_sig = filter.Low();
 
@@ -470,6 +483,13 @@ void MyCallback(AudioHandle::InputBuffer in, AudioHandle::OutputBuffer out, size
       delay.Write(out_sig + (delayed * feedback));
       out_sig = out_sig * (1-mix) + (delayed * mix);
     }
+
+    // Apply the envlope 
+    sig *= env;
+
+    // Amp modulation
+    float mod_amp = env * (1.0f + lfo_sig * 0.03f); // 5% amplitude swing
+    out_sig *= mod_amp;
 
     out[0][i] = out_sig;
     out[1][i] = out_sig;
@@ -501,6 +521,10 @@ int main(void) {
   // Configure the UI controls
   SetupButtons();
   SetupKnobs();
+
+  // Random seed so we get different patterns
+  tempo_knob.Process();
+  srand(tempo_param.Process());
 
   // Setup the inital sequence
   GenerateSequence();
