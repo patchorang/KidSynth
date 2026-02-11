@@ -150,6 +150,30 @@ enum AdcChannel {
   NUM_ADC_CHANNELS
 };
 
+// Helper to generate a fairly unique random seed from raw ADC noise
+uint32_t GenerateRandomSeed()
+{
+  uint32_t seed = System::GetNow();
+
+  auto mix = [&seed](uint32_t x) {
+    seed ^= x + 0x9e3779b9u + (seed << 6) + (seed >> 2);
+  };
+
+  // Sample raw ADC values multiple times — the LSBs jitter with analog noise
+  // which gives us real entropy that survives across reboots
+  for(int round = 0; round < 16; round++)
+  {
+    System::Delay(1);  // Let ADC acquire a fresh sample each round
+    for(int ch = 0; ch < NUM_ADC_CHANNELS; ch++)
+    {
+      mix(hw.adc.Get(ch));
+    }
+    mix(System::GetNow());  // Timing jitter between rounds adds entropy too
+  }
+
+  return seed;
+}
+
 // AUDIO FUNCTIONS //
 
 // Update all oscillators' frequencies based on a base frequency
@@ -538,6 +562,8 @@ void UpdateSequence() {
   sequence_button.Debounce();
   if(sequence_button.RisingEdge()) {
     sequence_led_timer = LED_PULSE_MS;
+    // Reseed RNG so each generated pattern is more unique
+    srand(GenerateRandomSeed());
     GenerateSequence();
   }
 
@@ -797,8 +823,7 @@ int main(void) {
   SetupKnobs();
 
   // Random seed so we get different patterns
-  tempo_knob.Process();
-  srand(tempo_param.Process());
+  srand(GenerateRandomSeed());
 
   // Setup the inital sequence
   GenerateSequence();
